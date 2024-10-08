@@ -33,7 +33,6 @@ class GetMaskFromAlpha:
 
         # Separate the RGBA channels
         _, _, _, alpha = image_array[:, :, 0], image_array[:, :, 1], image_array[:, :, 2], image_array[:, :, 3]
-        print(alpha)
 
         # Define an alpha threshold (e.g., 128 for 50% transparency)
         alpha_threshold = 128
