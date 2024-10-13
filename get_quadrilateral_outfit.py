@@ -1,28 +1,85 @@
-from PIL import Image
-import torch
 import numpy as np
+import cv2
+import sympy
+from typing import List, Tuple
+import torch
 from torch import Tensor
 
-def tensor2pil(image: Tensor) -> Image.Image:
-    return Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+def tensor2cv2(image: Tensor) -> np.ndarray:
+    img = np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8)
+    if img.ndim == 3 and img.shape[0] == 3:
+        img = np.transpose(img, (1, 2, 0)) 
+    return img
 
-
-def pil2tensor(image: Image.Image) -> Tensor:
-    return torch.from_numpy(np.array(image).astype(np.float32) / 255.0).unsqueeze(0)
-
-def tan(x):
-    if x == 18:
-        return 1e+9
+def cv22tensor(image: np.ndarray) -> torch.Tensor:
+    image = image.astype(np.float32) / 255.0
+    if image.ndim == 3 and image.shape[0] == 3:
+        tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
     else:
-        return np.tan(x * np.pi / 36.)
-    
-def cot(x):
-    if x == 0:
-        return 1e+9
-    else:
-        return 1 / np.tan(x * np.pi / 36.)
+        tensor = torch.from_numpy(image).unsqueeze(0)
+    return tensor
+
+# Function to approximate the best fitting N-gon (quadrilateral)
+def appx_best_fit_ngon(mask_cv2: np.ndarray, n: int = 4) -> List[Tuple[int, int]]:
+    # Convert the image to grayscale and find contours
+    mask_cv2_gray = cv2.cvtColor(mask_cv2, cv2.COLOR_RGB2GRAY)
+    contours, _ = cv2.findContours(mask_cv2_gray, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    hull = cv2.convexHull(contours[0])
+    hull = np.array(hull).reshape((len(hull), 2))
+
+    # Convert points to sympy Points
+    hull = [sympy.Point(*pt) for pt in hull]
+
+    # Reduce the hull points to an n-gon
+    while len(hull) > n:
+        best_candidate = None
+        for edge_idx_1 in range(len(hull)):
+            edge_idx_2 = (edge_idx_1 + 1) % len(hull)
+
+            adj_idx_1 = (edge_idx_1 - 1) % len(hull)
+            adj_idx_2 = (edge_idx_1 + 2) % len(hull)
+
+            edge_pt_1 = sympy.Point(*hull[edge_idx_1])
+            edge_pt_2 = sympy.Point(*hull[edge_idx_2])
+            adj_pt_1 = sympy.Point(*hull[adj_idx_1])
+            adj_pt_2 = sympy.Point(*hull[adj_idx_2])
+
+            subpoly = sympy.Polygon(adj_pt_1, edge_pt_1, edge_pt_2, adj_pt_2)
+            angle1 = subpoly.angles[edge_pt_1]
+            angle2 = subpoly.angles[edge_pt_2]
+
+            # Skip if the sum of the angles is not more than 180°
+            if sympy.N(angle1 + angle2) <= sympy.pi:
+                continue
+
+            # Find intersection of adjacent edges
+            adj_edge_1 = sympy.Line(adj_pt_1, edge_pt_1)
+            adj_edge_2 = sympy.Line(edge_pt_2, adj_pt_2)
+            intersect = adj_edge_1.intersection(adj_edge_2)[0]
+
+            # Calculate the area of the triangle and update best candidate
+            area = sympy.N(sympy.Triangle(edge_pt_1, intersect, edge_pt_2).area)
+            if best_candidate and best_candidate[1] < area:
+                continue
+
+            better_hull = list(hull)
+            better_hull[edge_idx_1] = intersect
+            del better_hull[edge_idx_2]
+            best_candidate = (better_hull, area)
+
+        if not best_candidate:
+            raise ValueError("Could not find the best fit n-gon!")
+
+        hull = best_candidate[0]
+
+    # Convert the hull points back to Python integers
+    return [(int(x), int(y)) for x, y in hull]
+
 
 class GetQuadrilateralOutfit:
+    def __init__(self):
+        pass
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -31,116 +88,39 @@ class GetQuadrilateralOutfit:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "INT", "INT", "INT", "INT", "INT", )
+    RETURN_TYPES = ("INT", "INT", "INT", "INT", "INT", "INT", "INT", "INT", )
     RETURN_NAMES = ("x1", "y1", "x2", "y2", "x3", "y3", "x4", "y4",)
     FUNCTION = "get_quadrilateral_outfit"
-
     CATEGORY = "image/"
 
     def get_quadrilateral_outfit(self, image):
-        image = tensor2pil(image)
+        # Load the image using OpenCV
+        img = tensor2cv2(image)
 
-        # Convert the image to a NumPy array
-        image_array = np.array(image)
+        # Get dimensions of the original image
+        original_height, original_width, _ = img.shape
 
-        # Get height and width
-        height, width = image_array[:2]
+        # Create a black image 2x the size of the original image
+        black_image_width = original_width * 2
+        black_image_height = original_height * 2
+        black_image = np.zeros((black_image_height, black_image_width, 3), dtype=np.uint8)
 
-        # Set length step
-        l_step = min(height, width) / 100
+        # Calculate the position to center the original image
+        paste_x = (black_image_width - original_width) // 2
+        paste_y = (black_image_height - original_height) // 2
 
-        # Initialize angles
-        angle_1, angle_2, angle_3, angle_4 = 1
-        x_1, y_1, x_2, y_2, x_3, y_3, x_4, y_4 = 0
+        # Place the original image in the center of the black image
+        black_image[paste_y:paste_y + original_height, paste_x:paste_x + original_width] = img
 
-        # Process
-        tmp = width * height
-        flag = False
-        while angle_1 <= 18:
-            y1 = 0
-            while y1 < height:
-                x = 0
-                while x < min(width, y1 * tan(angle_1)):
-                    if image_array[int(y1 - x * cot(angle_1)), x, 0] > 128:
-                        flag = True
-                        break
-                    else:
-                        x = x + 1
-                if flag:
-                    break
-                else:
-                    y1 = y1 + l_step
-            flag = False
-            
-            while angle_2 <= 18:
-                x2 = width - 1
-                while x2 >= 0:
-                    y = 0
-                    while y < min(height, (width - x2) * tan(angle_2)):
-                        if image_array[y, int(x2 + y * cot(angle_2)), 0] > 128:
-                            flag = True
-                            break
-                        else:
-                            y = y + 1
-                    if flag:
-                        break
-                    else:
-                        x2 = x2 - l_step
-                flag = False
+        # Get the approximate quadrilateral around the object in the black image
+        hulls = appx_best_fit_ngon(black_image)
 
-                while angle_3 <= 18:
-                    y3 = height - 1
-                    while y3 >= 0:
-                        x = width - 1
-                        while x >= max(0, width - (height - y3) * tan(angle_3)):
-                            if image_array[int(y3 + (width - x) * cot(angle_3)), x, 0] > 128:
-                                flag = True
-                                break
-                            else:
-                                x = x - 1
-                        if flag:
-                            break
-                        else:
-                            y3 = y3 - l_step
-                    flag = False
+        # Adjust the hull coordinates relative to the center of the original image
+        res = (
+            hulls[0][0] - original_width // 2, hulls[0][1] - original_height // 2,
+            hulls[1][0] - original_width // 2, hulls[1][1] - original_height // 2,
+            hulls[2][0] - original_width // 2, hulls[2][1] - original_height // 2,
+            hulls[3][0] - original_width // 2, hulls[3][1] - original_height // 2,
+        )
 
-                    while angle_4 <= 18:
-                        x4 = 0
-                        while x4 < width:
-                            y = height - 1
-                            while y >= max(0, width - x4 * tan(angle_4)):
-                                if image_array[y, int(x4 - (height - y) * cot(angle_4)), 0] > 128:
-                                    flag = True
-                                    break
-                                else:
-                                    y = y - 1
-                            if flag:
-                                break
-                            else:
-                                x4 = x4 + l_step
-                        flag = False
-
-                        # Calculate the black part of quadrilateral
-                        black = 0
-                        for i in range(width):
-                            for j in range(height):
-                                if j > y1 - i * cot(angle_1) and \
-                                    i < x2 + j * cot(angle_2) and \
-                                    j < y3 + (width - i) * cot(angle_3) and \
-                                    i > x4 - (height - j) * cot(angle_4) and \
-                                    image_array[j, i, 0] < 128:
-                                    black = black + 1
-
-                        if black < tmp:
-                            tmp = black
-                            
-                            x_1 = (y1 + x2 * tan(angle_2)) / (tan(angle_2) + cot(angle_1))
-                            y_1 = (y1 * cot(angle_1) - x2) / (tan(angle_1) + cot(angle_2))
-                            x_2 = (x2 + y3 * tan(angle_3)) / (tan(angle_3) + cot(angle_2))
-                            y_2 = (x2 * cot(angle_2) - y3) / (tan(angle_2) + cot(angle_3))
-                            x_3 = (y3 + x4 * tan(angle_4)) / (tan(angle_4) + cot(angle_3))
-                            y_3 = (y3 * cot(angle_3) - x4) / (tan(angle_3) + cot(angle_4))
-                            x_4 = (x4 + y1 * tan(angle_1)) / (tan(angle_1) + cot(angle_4))
-                            y_4 = (x4 * cot(angle_4) - y1) / (tan(angle_4) + cot(angle_1))
-
-        return (x_1, y_1, x_2, y_2, x_3, y_3, x_4, y_4, )
+        return res
